@@ -1,0 +1,403 @@
+<!doctype html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
+  <title>WebAR 手势互动圣诞树（改进版）</title>
+  <style>
+    html,body { height:100%; margin:0; background:#000; font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; color:#fff; }
+    #canvas-container { position:fixed; inset:0; overflow:hidden; z-index:1; }
+    #input-video { display:none; position:fixed; right:10px; bottom:10px; width:160px; height:auto; z-index:20; border:2px solid rgba(255,255,255,0.12); border-radius:8px; }
+    #loading {
+      position:fixed; left:50%; top:50%; transform:translate(-50%,-50%);
+      background:rgba(0,0,0,0.7); padding:18px 22px; border-radius:10px; z-index:30;
+      text-align:center; font-size:15px;
+    }
+    .instruction {
+      position:fixed; left:0; right:0; bottom:18px; text-align:center; z-index:25;
+      pointer-events:none; color:#ffd54f; font-weight:600; text-shadow:0 1px 2px #000; font-size:15px;
+    }
+    #controls {
+      position:fixed; left:12px; top:12px; z-index:30; display:flex; gap:8px; align-items:center;
+    }
+    .btn {
+      background:rgba(255,255,255,0.06); color:#fff; padding:8px 10px; border-radius:8px; border:1px solid rgba(255,255,255,0.06);
+      cursor:pointer; font-size:13px;
+    }
+    .btn:active{ transform:translateY(1px); }
+    #error { position:fixed; left:50%; top:12px; transform:translateX(-50%); z-index:40; background:#b00020; padding:8px 12px; border-radius:8px; display:none; }
+    #debug { position:fixed; right:12px; top:12px; z-index:30; background:rgba(0,0,0,0.4); padding:8px 10px; border-radius:8px; font-size:12px; display:none; color:#cfc; }
+  </style>
+
+  <!-- MediaPipe (non-module globals) -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+
+  <!-- importmap for three (ESM) -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+      }
+    }
+  </script>
+</head>
+<body>
+  <div id="loading">正在初始化摄像头和 AI 模型...<br/>请允许摄像头权限</div>
+
+  <div id="controls">
+    <button id="toggleVideo" class="btn">显示视频背景</button>
+    <button id="toggleDebug" class="btn">Debug</button>
+    <button id="manualPhoto" class="btn">手动弹出照片</button>
+  </div>
+
+  <div id="error" role="alert"></div>
+  <div id="debug"></div>
+  <div class="instruction">🎄 伸出手掌显示树 | 👌 捏合大拇指与食指弹出照片</div>
+
+  <video id="input-video" autoplay playsinline muted></video>
+  <div id="canvas-container"></div>
+
+  <script type="module">
+    import * as THREE from 'three';
+
+    // DOM
+    const container = document.getElementById('canvas-container');
+    const loadingEl = document.getElementById('loading');
+    const errorEl = document.getElementById('error');
+    const debugEl = document.getElementById('debug');
+    const videoEl = document.getElementById('input-video');
+    const toggleVideoBtn = document.getElementById('toggleVideo');
+    const toggleDebugBtn = document.getElementById('toggleDebug');
+    const manualPhotoBtn = document.getElementById('manualPhoto');
+
+    // State & configuration
+    let showVideoBackground = true;
+    let showDebug = false;
+    let isPinching = false;
+    let pinchConfirmTimer = 0;
+    let pinchReleaseTimer = 0;
+    const pinchConfirmMs = 100; // 持续确认时间
+    const pinchReleaseMs = 180; // 持续释放确认时间
+
+    // --- Three.js 基本设置 ---
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(70, window.innerWidth/window.innerHeight, 0.01, 200);
+    camera.position.set(0, 0.8, 5);
+
+    const renderer = new THREE.WebGLRenderer({ alpha: true, antialias: true });
+    renderer.setPixelRatio(window.devicePixelRatio || 1);
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    container.appendChild(renderer.domElement);
+
+    // Lights
+    const ambient = new THREE.AmbientLight(0xffffff, 0.6);
+    scene.add(ambient);
+    const dir = new THREE.DirectionalLight(0xfff4cc, 1.2);
+    dir.position.set(5, 10, 7);
+    scene.add(dir);
+
+    // Optional video background plane
+    let videoBgMesh = null;
+    let videoTexture = null;
+
+    function createVideoBackground() {
+      if (!videoTexture) return;
+      if (videoBgMesh) return;
+      const geom = new THREE.PlaneGeometry(16, 9);
+      const mat = new THREE.MeshBasicMaterial({ map: videoTexture, toneMapped: false });
+      videoBgMesh = new THREE.Mesh(geom, mat);
+      // place far behind
+      videoBgMesh.scale.set(1.2 * (window.innerWidth / window.innerHeight), 1.2, 1);
+      videoBgMesh.position.set(0, 0, -10);
+      scene.add(videoBgMesh);
+    }
+
+    function removeVideoBackground() {
+      if (videoBgMesh) {
+        scene.remove(videoBgMesh);
+        videoBgMesh.geometry.dispose();
+        videoBgMesh.material.dispose();
+        videoBgMesh = null;
+      }
+    }
+
+    // --- 3D 对象：圣诞树 和 照片 ---
+    const treeGroup = new THREE.Group();
+    scene.add(treeGroup);
+
+    // Tree (cone)
+    const treeGeom = new THREE.ConeGeometry(1.5, 4, 32);
+    const treeMat = new THREE.MeshStandardMaterial({ color: 0x0b6623, roughness: 0.45, metalness: 0.1 });
+    const treeMesh = new THREE.Mesh(treeGeom, treeMat);
+    treeMesh.position.y = -0.6;
+    treeGroup.add(treeMesh);
+
+    // Decorations
+    for (let i=0;i<40;i++){
+      const g = new THREE.SphereGeometry(0.08, 12, 12);
+      const m = new THREE.MeshStandardMaterial({ color: Math.random() > 0.5 ? 0xff4d4d : 0xffd24d, roughness:0.4 });
+      const s = new THREE.Mesh(g,m);
+      const theta = Math.random() * Math.PI * 2;
+      const y = Math.random() * 3 - 1.4;
+      const r = Math.max(0.2, (1.5 - (y + 2) * 0.3) * 0.8);
+      s.position.set(Math.cos(theta)*r, y-0.6, Math.sin(theta)*r);
+      treeGroup.add(s);
+    }
+
+    // Photo plane (pop-up)
+    const fallbackImg = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(
+      `<svg xmlns="http://www.w3.org/2000/svg" width="600" height="800">` +
+      `<rect width="100%" height="100%" fill="#222"/><text x="50%" y="50%" fill="#ddd" font-size="28" text-anchor="middle" dominant-baseline="middle">图片加载失败</text></svg>`
+    );
+
+    const photoURL = 'https://images.unsplash.com/photo-1543258103-a62bdc069871?q=80&w=900&auto=format&fit=crop';
+    const loader = new THREE.TextureLoader();
+    let photoTexture = null;
+    loader.load(photoURL,
+      (tex) => { photoTexture = tex; photoTexture.encoding = THREE.sRGBEncoding; },
+      undefined,
+      () => { // onError
+        photoTexture = loader.load(fallbackImg);
+      }
+    );
+
+    const photoGeom = new THREE.PlaneGeometry(2, 2.6);
+    const photoMat = new THREE.MeshBasicMaterial({ map: photoTexture, transparent:true, opacity:0, side: THREE.DoubleSide });
+    const photoMesh = new THREE.Mesh(photoGeom, photoMat);
+    photoMesh.position.set(0, -0.2, 1.4);
+    photoMesh.scale.set(0.001,0.001,0.001); // almost zero
+    scene.add(photoMesh);
+
+    // --- MediaPipe Hands 初始化 ---
+    const hands = new Hands({locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`});
+    hands.setOptions({
+      maxNumHands: 1,
+      modelComplexity: 1, // 可设为 0 以节省性能
+      minDetectionConfidence: 0.5,
+      minTrackingConfidence: 0.5
+    });
+    hands.onResults(onResults);
+
+    // Camera helper (MediaPipe)
+    let cameraUtils = null;
+
+    // Adaptive resolution based on device
+    function pickVideoConstraints() {
+      const maxW = Math.min(1280, Math.round(window.innerWidth * (window.devicePixelRatio || 1)));
+      const maxH = Math.min(720, Math.round(window.innerHeight * (window.devicePixelRatio || 1)));
+      // On small screens, use lower
+      if (window.innerWidth < 600) {
+        return { width: 640, height: 480 };
+      }
+      return { width: Math.min(1280, maxW), height: Math.min(720, maxH) };
+    }
+
+    async function startCamera() {
+      const constraints = { video: { ...pickVideoConstraints(), facingMode: 'environment' } };
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia(constraints);
+        videoEl.srcObject = stream;
+        // create THREE video texture
+        videoTexture = new THREE.VideoTexture(videoEl);
+        videoTexture.minFilter = THREE.LinearFilter;
+        videoTexture.magFilter = THREE.LinearFilter;
+        videoTexture.format = THREE.RGBFormat;
+        // start MediaPipe camera wrapper
+        cameraUtils = new Camera(videoEl, {
+          onFrame: async () => { await hands.send({image: videoEl}); },
+          width: constraints.video.width,
+          height: constraints.video.height
+        });
+        await cameraUtils.start();
+        // show preview small video for user feedback
+        videoEl.style.display = 'block';
+        if (showVideoBackground) createVideoBackground();
+        loadingEl.style.display = 'none';
+      } catch (err) {
+        console.error('摄像头启动失败', err);
+        loadingEl.style.display = 'none';
+        errorEl.style.display = 'block';
+        errorEl.textContent = '无法访问摄像头：请检查权限或在 HTTPS 下打开本页面。';
+      }
+    }
+
+    // --- 手势判定逻辑（更稳健） ---
+    // We'll use 3D euclidean distance using x,y,z from mediapipe landmarks (normalized).
+    // Use depth (z) to adapt threshold and use short debounce timers.
+
+    let lastHandX = 0.5;
+    function onResults(results) {
+      loadingEl.style.display = 'none';
+      if (!results.multiHandLandmarks || results.multiHandLandmarks.length === 0) {
+        // no hand: slowly hide photo and reset
+        pinchConfirmTimer = 0;
+        pinchReleaseTimer = 0;
+        // optional: slowly center tree
+        lastHandX += (0.5 - lastHandX) * 0.06;
+        treeGroup.rotation.y = (lastHandX - 0.5) * 1.8;
+        return;
+      }
+
+      const lm = results.multiHandLandmarks[0];
+      const thumb = lm[4];
+      const index = lm[8];
+      const palm = lm[9];
+
+      // 3D distance (normalized)
+      const dx = thumb.x - index.x;
+      const dy = thumb.y - index.y;
+      const dz = (thumb.z || 0) - (index.z || 0);
+      const dist3 = Math.sqrt(dx*dx + dy*dy + dz*dz);
+
+      // adapt threshold with depth: when hand closer (z more negative) the normalized z magnitude increases.
+      // thumb.z is typically negative when towards camera; take abs to scale.
+      const depth = Math.abs((thumb.z || 0) + (index.z || 0)) * 0.5;
+      const base = 0.05;
+      const thresholdClose = base + depth * 0.6; // smaller threshold when far, bigger when close
+      const thresholdFar = thresholdClose + 0.06; // hysteresis
+
+      // debug
+      if (showDebug) {
+        debugEl.style.display = 'block';
+        debugEl.textContent = `dist3:${dist3.toFixed(4)} thr:${thresholdClose.toFixed(4)} depth:${depth.toFixed(4)}`;
+      } else {
+        debugEl.style.display = 'none';
+      }
+
+      // Debounce logic: require distance < thresholdClose for a short duration to confirm pinch
+      const now = performance.now();
+      if (dist3 < thresholdClose) {
+        pinchConfirmTimer += 16; // approx frame ms, simple increment
+        pinchReleaseTimer = 0;
+      } else if (dist3 > thresholdFar) {
+        pinchReleaseTimer += 16;
+        pinchConfirmTimer = 0;
+      } else {
+        // between thresholds: small decay
+        pinchConfirmTimer = Math.max(0, pinchConfirmTimer - 8);
+        pinchReleaseTimer = Math.max(0, pinchReleaseTimer - 8);
+      }
+
+      // confirm pinch
+      if (!isPinching && pinchConfirmTimer > pinchConfirmMs) {
+        isPinching = true;
+        showPhoto();
+      }
+      // confirm release
+      if (isPinching && pinchReleaseTimer > pinchReleaseMs) {
+        isPinching = false;
+        hidePhoto();
+      }
+
+      // Simple parallax: rotate tree by palm x
+      lastHandX = palm.x;
+      treeGroup.rotation.y = (lastHandX - 0.5) * 1.8;
+    }
+
+    // --- Photo show/hide animation with easing ---
+    let photoTargetScale = 0;
+    let photoTargetOpacity = 0;
+    function showPhoto() {
+      console.log('捏合确认：显示照片');
+      photoTargetScale = 1;
+      photoTargetOpacity = 1;
+    }
+    function hidePhoto() {
+      console.log('松开确认：隐藏照片');
+      photoTargetScale = 0;
+      photoTargetOpacity = 0;
+    }
+
+    // Manual toggle button
+    manualPhotoBtn.addEventListener('click', () => {
+      if (photoTargetScale > 0.5) {
+        hidePhoto();
+      } else {
+        showPhoto();
+      }
+    });
+
+    // Toggle video background
+    toggleVideoBtn.addEventListener('click', () => {
+      showVideoBackground = !showVideoBackground;
+      toggleVideoBtn.textContent = showVideoBackground ? '显示视频背景' : '隐藏视频背景';
+      if (showVideoBackground) createVideoBackground(); else removeVideoBackground();
+    });
+
+    toggleDebugBtn.addEventListener('click', () => {
+      showDebug = !showDebug;
+      toggleDebugBtn.textContent = showDebug ? 'Debug' : 'Debug';
+      debugEl.style.display = showDebug ? 'block' : 'none';
+    });
+
+    // --- 渲染循环 ---
+    function animate() {
+      requestAnimationFrame(animate);
+
+      // gentle auto-rotation
+      treeGroup.rotation.y += 0.003;
+
+      // photo easing (use exponential-like smoothing)
+      const ease = 0.16;
+      const sCurrent = photoMesh.scale.x;
+      const sNext = sCurrent + (photoTargetScale - sCurrent) * ease;
+      photoMesh.scale.setScalar(sNext);
+      photoMesh.material.opacity += (photoTargetOpacity - photoMesh.material.opacity) * ease;
+
+      // small pop effect when opening
+      if (photoTargetScale > 0.5 && photoMesh.scale.x > 0.95) {
+        // slight bob
+        photoMesh.position.z = 1.4 + Math.sin(performance.now()/180) * 0.02;
+      } else {
+        photoMesh.position.z = 1.4;
+      }
+
+      renderer.render(scene, camera);
+    }
+    animate();
+
+    // Resize
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      if (videoBgMesh) {
+        videoBgMesh.scale.set(1.2 * (window.innerWidth / window.innerHeight), 1.2, 1);
+      }
+    });
+
+    // Start whole flow
+    (async () => {
+      // Check secure context
+      if (!window.isSecureContext) {
+        loadingEl.style.display = 'none';
+        errorEl.style.display = 'block';
+        errorEl.innerHTML = '推荐在 HTTPS（或 localhost）环境下使用摄像头功能。当前不是安全上下文，摄像头可能无法工作。';
+        return;
+      }
+
+      // Start camera and mediapipe
+      await startCamera();
+
+      // Wait a little for video to be ready before creating background
+      videoEl.addEventListener('loadeddata', () => {
+        if (videoTexture && showVideoBackground) createVideoBackground();
+      });
+
+      // If texture for photo wasn't ready when created, assign later
+      const checkPhotoTex = setInterval(() => {
+        if (photoTexture && photoMesh.material.map !== photoTexture) {
+          photoMesh.material.map = photoTexture;
+          photoMesh.material.needsUpdate = true;
+          clearInterval(checkPhotoTex);
+        }
+      }, 300);
+    })();
+
+  </script>
+</body>
+</html>
